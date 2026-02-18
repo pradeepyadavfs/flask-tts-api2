@@ -206,14 +206,8 @@ def text_to_speech():
         
         # If phone_number is provided, trigger Twilio call
         if phone_number:
-            # Get base URL from environment
-            base_url = os.getenv("BASE_URL")
-            if not base_url:
-                # Clean up file and return error
-                os.remove(filepath)
-                return jsonify({
-                    "error": "BASE_URL not configured. Cannot trigger call."
-                }), 500
+            # Dynamically detect base URL from request
+            base_url = request.host_url.rstrip("/")
             
             # Create public URL for the audio file
             audio_url = f"{base_url}/audio/{filename}"
