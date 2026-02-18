@@ -1,0 +1,9 @@
+# TTS Flask Application Requirements
+flask
+torch
+transformers
+scipy
+soundfile
+gunicorn
+twilio
+

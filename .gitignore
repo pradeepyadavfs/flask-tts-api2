@@ -1,0 +1,10 @@
+# Git ignore for TTS deployment
+__pycache__/
+*.pyc
+.env
+.python-version
+pyproject.toml
+venv/
+generated_audio/
+.DS_Store
+

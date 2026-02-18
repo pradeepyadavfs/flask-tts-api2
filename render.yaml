@@ -1,0 +1,19 @@
+# Render.com deployment configuration
+# This file defines a web service for deployment on Render
+
+services:
+  - type: web
+    name: tts-api
+    env: docker
+    autoDeploy: true
+    healthCheckPath: /health
+    port: 5000
+    envVars:
+      - key: PORT
+        value: "5000"
+      # Add these in Render Dashboard Settings:
+      # - TWILIO_ACCOUNT_SID (your Twilio Account SID)
+      # - TWILIO_AUTH_TOKEN (your Twilio Auth Token)
+      # - TWILIO_PHONE_NUMBER (your Twilio phone number)
+      # - BASE_URL (your Render app URL)
+
