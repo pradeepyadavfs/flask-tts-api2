@@ -1,3 +1,4 @@
+
 # Requirements:
 # flask
 # torch
@@ -24,7 +25,9 @@ import os
 import uuid
 import torch
 import soundfile as sf
-from flask import Flask, request, jsonify, send_file, after_this_request
+import threading
+import time
+from flask import Flask, request, jsonify, send_file
 from transformers import AutoProcessor, BarkModel
 from twilio.rest import Client
 from twilio.twiml import VoiceResponse
@@ -124,17 +127,32 @@ def trigger_twilio_call(phone_number, audio_url):
         return {"error": f"Failed to trigger call: {str(e)}"}, 500
 
 
-def schedule_file_deletion(filepath):
-    """Schedule file deletion after response is sent."""
-    @after_this_request
-    def remove_file(response):
+def delete_file_later(file_path, delay=90):
+    """
+    Delete a file after a specified delay in a background thread.
+    Gives Twilio enough time to fetch the audio before cleanup.
+    
+    Args:
+        file_path: Path to the file to delete
+        delay: Seconds to wait before deletion (default 90)
+    """
+    def _deleter():
         try:
-            if os.path.exists(filepath):
-                os.remove(filepath)
-                print(f"Cleaned up: {filepath}")
+            time.sleep(delay)
+            if os.path.exists(file_path):
+                os.remove(file_path)
+                print(f"Delayed cleanup: deleted {file_path}")
         except Exception as e:
-            print(f"Error removing file: {e}")
-        return response
+            print(f"Error in delayed cleanup: {e}")
+    
+    # Run in background thread to avoid blocking main thread
+    thread = threading.Thread(target=_deleter, daemon=True)
+    thread.start()
+
+
+def schedule_file_deletion(filepath):
+    """Schedule file deletion after response is sent (legacy - using new delayed cleanup)."""
+    delete_file_later(filepath, delay=90)
 
 
 @app.route('/tts', methods=['POST'])
@@ -215,8 +233,8 @@ def text_to_speech():
             # Trigger the Twilio call
             call_result, status_code = trigger_twilio_call(phone_number, audio_url)
             
-            # Clean up the audio file after triggering call
-            os.remove(filepath)
+            # Schedule delayed cleanup (90 seconds) to give Twilio time to fetch audio
+            delete_file_later(filepath, delay=90)
             
             if status_code != 200:
                 return jsonify(call_result), status_code
