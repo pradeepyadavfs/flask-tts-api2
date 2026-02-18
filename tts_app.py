@@ -1,4 +1,3 @@
-
 # Requirements:
 # flask
 # torch
@@ -19,18 +18,33 @@ Production-ready implementation with:
 - Proper error handling
 - Optimized performance
 - Twilio phone call integration
+- Logging
+- Rate limiting
+- Input sanitization
+- Metrics tracking
 """
 
 import os
+import re
 import uuid
+import logging
 import torch
 import soundfile as sf
 import threading
 import time
+from collections import defaultdict
+from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, send_file
 from transformers import AutoProcessor, BarkModel
 from twilio.rest import Client
 from twilio.twiml import VoiceResponse
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # Initialize Flask app (production-ready, debug=False)
 app = Flask(__name__)
@@ -49,20 +63,29 @@ SAMPLE_RATE = 24000
 AUDIO_FOLDER = "generated_audio"
 MAX_TEXT_LENGTH = 100
 
+# Rate limiting: 5 requests per IP per minute
+rate_limit_store = defaultdict(list)
+RATE_LIMIT = 5
+RATE_LIMIT_WINDOW = 60  # seconds
+
+# Metrics counters
+total_calls_made = 0
+total_tts_generated = 0
+
 
 def load_model():
     """Load the Bark model and processor at startup with GPU support."""
     global processor, model, device, model_loaded
     
-    print("Loading Bark model and processor...")
+    logger.info("Loading Bark model and processor...")
     
     # Detect GPU/CPU
     if torch.cuda.is_available():
         device = torch.device("cuda")
-        print(f"GPU detected! Using CUDA device: {torch.cuda.get_device_name(0)}")
+        logger.info(f"GPU detected! Using CUDA device: {torch.cuda.get_device_name(0)}")
     else:
         device = torch.device("cpu")
-        print("No GPU detected. Using CPU for inference.")
+        logger.info("No GPU detected. Using CPU for inference.")
     
     # Load processor and model
     processor = AutoProcessor.from_pretrained("suno/bark-small")
@@ -73,14 +96,87 @@ def load_model():
     model.eval()  # Set to evaluation mode
     
     model_loaded = True
-    print("Model loaded successfully!")
+    logger.info("Model loaded successfully!")
 
 
 def create_audio_folder():
     """Create the audio output folder if it doesn't exist."""
     if not os.path.exists(AUDIO_FOLDER):
         os.makedirs(AUDIO_FOLDER)
-        print(f"Created audio folder: {AUDIO_FOLDER}")
+        logger.info(f"Created audio folder: {AUDIO_FOLDER}")
+
+
+def sanitize_text(text):
+    """
+    Sanitize input text by stripping whitespace and validating content.
+    
+    Args:
+        text: Raw input text
+        
+    Returns:
+        tuple: (is_valid, sanitized_text, error_message)
+    """
+    # Strip extra whitespace
+    sanitized = text.strip()
+    
+    # Check if empty after strip
+    if not sanitized:
+        return False, "", "Text cannot be empty"
+    
+    # Check if only special characters (allow letters, numbers, spaces, basic punctuation)
+    # This regex matches strings that have at least one alphanumeric character
+    if not re.search(r'[a-zA-Z0-9]', sanitized):
+        return False, "", "Text must contain at least one alphanumeric character"
+    
+    return True, sanitized, None
+
+
+def check_rate_limit(ip):
+    """
+    Check if IP has exceeded rate limit.
+    
+    Args:
+        ip: Client IP address
+        
+    Returns:
+        tuple: (is_allowed, error_response)
+    """
+    now = datetime.now()
+    cutoff = now - timedelta(seconds=RATE_LIMIT_WINDOW)
+    
+    # Clean old entries
+    rate_limit_store[ip] = [t for t in rate_limit_store[ip] if t > cutoff]
+    
+    # Check limit
+    if len(rate_limit_store[ip]) >= RATE_LIMIT:
+        return False, jsonify({
+            "error": "Rate limit exceeded",
+            "error_code": "RATE_LIMIT_EXCEEDED",
+            "message": f"Maximum {RATE_LIMIT} requests per minute allowed",
+            "retry_after": RATE_LIMIT_WINDOW
+        }), 429
+    
+    # Add current request
+    rate_limit_store[ip].append(now)
+    return True, None, None
+
+
+def create_error_response(error_code, message, status_code=400):
+    """
+    Create a structured JSON error response.
+    
+    Args:
+        error_code: Machine-readable error code
+        message: Human-readable error message
+        status_code: HTTP status code
+        
+    Returns:
+        tuple: (JSON response, status code)
+    """
+    return jsonify({
+        "error": error_code,
+        "message": message
+    }), status_code
 
 
 def trigger_twilio_call(phone_number, audio_url):
@@ -94,6 +190,8 @@ def trigger_twilio_call(phone_number, audio_url):
     Returns:
         dict: Success message with call SID or error
     """
+    global total_calls_made
+    
     try:
         # Get Twilio credentials from environment
         account_sid = os.getenv("TWILIO_ACCOUNT_SID")
@@ -101,7 +199,8 @@ def trigger_twilio_call(phone_number, audio_url):
         twilio_phone = os.getenv("TWILIO_PHONE_NUMBER")
         
         if not all([account_sid, auth_token, twilio_phone]):
-            return {"error": "Twilio credentials not configured"}, 500
+            logger.error("Twilio credentials not configured")
+            return {"error": "Twilio credentials not configured", "error_code": "TWILIO_NOT_CONFIGURED"}, 500
         
         # Initialize Twilio client
         client = Client(account_sid, auth_token)
@@ -117,6 +216,9 @@ def trigger_twilio_call(phone_number, audio_url):
             twiml=str(twiml)
         )
         
+        total_calls_made += 1
+        logger.info(f"Call initiated: SID={call.sid}, to={phone_number}")
+        
         return {
             "success": True,
             "call_sid": call.sid,
@@ -124,7 +226,8 @@ def trigger_twilio_call(phone_number, audio_url):
         }, 200
         
     except Exception as e:
-        return {"error": f"Failed to trigger call: {str(e)}"}, 500
+        logger.error(f"Twilio call failed: {str(e)}")
+        return {"error": f"Failed to trigger call: {str(e)}", "error_code": "TWILIO_ERROR"}, 500
 
 
 def delete_file_later(file_path, delay=90):
@@ -141,9 +244,9 @@ def delete_file_later(file_path, delay=90):
             time.sleep(delay)
             if os.path.exists(file_path):
                 os.remove(file_path)
-                print(f"Delayed cleanup: deleted {file_path}")
+                logger.info(f"Delayed cleanup: deleted {file_path}")
         except Exception as e:
-            print(f"Error in delayed cleanup: {e}")
+            logger.error(f"Error in delayed cleanup: {e}")
     
     # Run in background thread to avoid blocking main thread
     thread = threading.Thread(target=_deleter, daemon=True)
@@ -151,7 +254,7 @@ def delete_file_later(file_path, delay=90):
 
 
 def schedule_file_deletion(filepath):
-    """Schedule file deletion after response is sent (legacy - using new delayed cleanup)."""
+    """Schedule file deletion after response is sent using delayed cleanup."""
     delete_file_later(filepath, delay=90)
 
 
@@ -170,36 +273,47 @@ def text_to_speech():
     - If phone_number provided: JSON response with call status
     - Otherwise: audio/wav file
     """
+    global total_tts_generated
+    
+    client_ip = request.remote_addr
+    logger.info(f"TTS request received from {client_ip}")
+    
+    # Check rate limit
+    is_allowed, error_response, status_code = check_rate_limit(client_ip)
+    if not is_allowed:
+        logger.warning(f"Rate limit exceeded for IP: {client_ip}")
+        return error_response, status_code
     
     # Check if request has JSON content
     if not request.is_json:
-        return jsonify({
-            "error": "Content-Type must be application/json"
-        }), 400
+        logger.warning(f"Invalid content type from {client_ip}")
+        return create_error_response("INVALID_CONTENT_TYPE", "Content-Type must be application/json", 400)
     
     # Get JSON data
     data = request.get_json()
     
     # Validate text field exists
     if 'text' not in data:
-        return jsonify({
-            "error": "Missing required field: 'text'"
-        }), 400
+        return create_error_response("MISSING_FIELD", "Missing required field: 'text'", 400)
     
     text = data.get('text', '')
     phone_number = data.get('phone_number', None)  # Optional phone number
     
-    # Validate text is not empty
-    if not text or not text.strip():
-        return jsonify({
-            "error": "Text field cannot be empty"
-        }), 400
+    # Sanitize input text
+    is_valid, sanitized_text, error_message = sanitize_text(text)
+    if not is_valid:
+        logger.warning(f"Invalid text input from {client_ip}: {error_message}")
+        return create_error_response("INVALID_TEXT", error_message, 400)
     
     # Validate text length (max 100 characters)
-    if len(text) > MAX_TEXT_LENGTH:
-        return jsonify({
-            "error": f"Text exceeds maximum length of {MAX_TEXT_LENGTH} characters (current: {len(text)})"
-        }), 400
+    if len(sanitized_text) > MAX_TEXT_LENGTH:
+        return create_error_response(
+            "TEXT_TOO_LONG",
+            f"Text exceeds maximum length of {MAX_TEXT_LENGTH} characters (current: {len(sanitized_text)})",
+            400
+        )
+    
+    logger.info(f"Processing TTS request: text_length={len(sanitized_text)}, phone={phone_number is not None}")
     
     # Generate unique filename
     filename = f"{uuid.uuid4()}.wav"
@@ -207,7 +321,7 @@ def text_to_speech():
     
     try:
         # Process input text
-        inputs = processor(text, voice_preset="v2_en_speaker_6")
+        inputs = processor(sanitized_text, voice_preset="v2_en_speaker_6")
         
         # Move inputs to the same device as model
         inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
@@ -221,6 +335,9 @@ def text_to_speech():
         
         # Save as WAV file with 24000 sample rate
         sf.write(filepath, audio_array, SAMPLE_RATE)
+        
+        total_tts_generated += 1
+        logger.info(f"TTS generated successfully: {filename}")
         
         # If phone_number is provided, trigger Twilio call
         if phone_number:
@@ -242,7 +359,7 @@ def text_to_speech():
             return jsonify({
                 "success": True,
                 "message": "Audio generated and call initiated",
-                "text": text,
+                "text": sanitized_text,
                 "call_sid": call_result.get("call_sid"),
                 "phone_number": phone_number
             }), 200
@@ -259,6 +376,16 @@ def text_to_speech():
         )
         
     except Exception as e:
+        error_str = str(e)
+        
+        # Determine error type for logging
+        if "model" in error_str.lower() or "processor" in error_str.lower():
+            logger.error(f"Model error: {error_str}")
+            error_code = "MODEL_ERROR"
+        else:
+            logger.error(f"TTS generation failed: {error_str}")
+            error_code = "GENERATION_ERROR"
+        
         # Clean up file if it was created but generation failed
         if os.path.exists(filepath):
             try:
@@ -266,9 +393,7 @@ def text_to_speech():
             except:
                 pass
         
-        return jsonify({
-            "error": f"Failed to generate speech: {str(e)}"
-        }), 500
+        return create_error_response(error_code, f"Failed to generate speech: {error_str}", 500)
 
 
 @app.route('/audio/<filename>', methods=['GET'])
@@ -296,9 +421,7 @@ def serve_audio(filename):
             as_attachment=False
         )
     else:
-        return jsonify({
-            "error": f"Audio file '{filename}' not found"
-        }), 404
+        return create_error_response("FILE_NOT_FOUND", f"Audio file '{filename}' not found", 404)
 
 
 @app.route('/health', methods=['GET'])
@@ -307,6 +430,20 @@ def health_check():
     return jsonify({
         "status": "ok",
         "model_loaded": model_loaded
+    })
+
+
+@app.route('/metrics', methods=['GET'])
+def metrics():
+    """
+    Metrics endpoint to track API usage.
+    
+    Returns:
+        JSON with total_calls_made and total_tts_generated
+    """
+    return jsonify({
+        "total_calls_made": total_calls_made,
+        "total_tts_generated": total_tts_generated
     })
 
 
